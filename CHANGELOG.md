@@ -4,6 +4,72 @@ All notable changes to **only-my-mem0ry** are documented here. The format follow
 [Keep a Changelog](https://keepachangelog.com/); the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] — 2026-08-18
+
+Recall now answers with **current truth**. A store this old accumulates
+corrections written as brand-new memories — the superseded one keeps its vector
+and keeps ranking, so a search returns last month's answer next to this month's.
+Measured on the real 776-memory store: **139 memories say in prose that an earlier
+one is wrong**, and every one of those earlier memories was still being returned.
+
+Nothing is deleted and no vector is touched; this is a sidecar-only lifecycle
+layer, so it is fully reversible.
+
+### Added
+- **`status` + `supersedes` in the sidecar.** `status[id]` is one of `active`,
+  `superseded`, `retired`; `supersedes[new_id] = {"replaces": [...], "reason": …}`
+  records what replaced what. Like tags/types/provenance, they survive mem0's
+  `update()` and never affect embeddings or ranking. **No migration is needed** —
+  a missing entry reads as `active`, so an existing store is unchanged on upgrade.
+- **`supersede_memory(new_id, old_ids, reason)`** — mark older memories as
+  replaced. Prefer it over `delete_memory` when a fact *changed* rather than
+  turned out to be junk: the trail of how you got here stays inspectable.
+- **`set_status(memory_id, status)`** — for `retired` (dead project, removed tool)
+  as opposed to superseded (something newer took its place).
+- **`add_memory(..., supersedes=…)`** — store the correction and retire what it
+  replaces in ONE call. Reconciling used to cost three calls while just adding cost
+  one, which is precisely why the store filled with stale pairs.
+- **`server/migrate_supersede.py`** — retro-apply relations from a *reviewed* pair
+  list (`--pairs`), dry-run by default. Deliberately not automatic: see Notes.
+
+### Changed
+- **`search_memories` hides superseded/retired by default.** Opt back in with
+  `include_superseded=True`, or inspect one bucket with `status=…`. When stale
+  results are shown they carry a `⚠️SUPERSEDED by <id>` / `🛑RETIRED` badge.
+  The status pass is skipped entirely while nothing is marked, so a store that
+  never uses the feature pays nothing.
+- **`list_memories` badges stale entries.** It is an inventory, not recall, so it
+  still lists everything — but an unmarked stale row there reads as current truth.
+- **`add_memory` gained an optional duplicate gate** (`MEM0_DUP_GATE=1`, threshold
+  `MEM0_DUP_GATE_THRESHOLD`, default 0.96). **Off by default** — see Notes.
+
+### Fixed
+- **`delete_memory` now clears `status`/`supersedes`** via
+  `mem0_store.forget_supersede()`. Without it a deleted id stayed marked forever
+  and live memories kept claiming to replace something gone, rendering as
+  `SUPERSEDED by <dead id>`; the sidecar grew a stale entry on every delete.
+
+### Notes
+- **Why the duplicate gate is off by default.** Refusing near-duplicate adds was
+  the obvious fix for the leak, and the measurement killed it. With the default e5
+  embedder, similarity across a real store is high and tight (median 0.845, p99
+  0.913, max 0.971), and eight hand-verified supersede pairs land at 0.896–0.952 —
+  inside the noise. Every threshold is a bad trade: 0.92 catches 62% of real
+  replacements while blocking **53% of all adds**; 0.95 blocks a tolerable 4.9% and
+  catches 12%. There is no separating value, so cosine alone cannot carry this
+  decision. The leak is addressed instead by making the right action cheap
+  (`supersedes=`). The gate is kept, off, for embedders that separate better —
+  retune with the same measurement before trusting it.
+- **Retro-application is not automatic, on purpose.** Of the 26 memories that both
+  cite another id and use correction wording, most turned out to be plain
+  cross-references (`참조`, `follows`, "see also"), and **two pointed the wrong
+  way** — the cited memory was the *newer* one, its own text already saying
+  `SUPERSEDED`. Applying those mechanically would have hidden the current memory
+  and surfaced the obsolete one. 6 pairs / 8 memories survived review.
+- Partial corrections ("supersedes *parts of* …") are deliberately left alone:
+  hiding the whole memory would take valid content with it. Those want
+  `update_memory` on the wrong sentence, not a status flip.
+
 ## [0.8.1] — 2026-06-19
 
 Hardening + a config fix from a full code review. No runtime correctness bugs were

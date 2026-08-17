@@ -95,7 +95,8 @@ def acquire_single_writer_lock(chroma_path: str, retry_seconds: float = 10.0):
 def load_meta(path: str) -> dict:
     """Load the pin/usage sidecar, tolerating a missing or corrupt file. Always
     returns a dict with at least {"pinned": [...], "access": {...}, "tags": {...},
-    "types": {...}, "provenance": {...}, "confidence": {...}, "history": {...}}."""
+    "types": {...}, "provenance": {...}, "confidence": {...}, "history": {...},
+    "status": {...}, "supersedes": {...}}."""
     try:
         with open(path, encoding="utf-8") as f:
             meta = json.load(f)
@@ -110,6 +111,8 @@ def load_meta(path: str) -> dict:
     meta.setdefault("provenance", {})
     meta.setdefault("confidence", {})
     meta.setdefault("history", {})
+    meta.setdefault("status", {})
+    meta.setdefault("supersedes", {})
     return meta
 
 
@@ -237,6 +240,104 @@ def normalize_confidence(value) -> "str | None":
     if not s:
         return ""
     return s if s in CONFIDENCE_LEVELS else None
+
+
+# ---- status (is this memory still current?) ----------------------------------
+# The store is append-only in practice: when a fact changes, the agent writes a NEW
+# memory saying "the old one was wrong" and the stale one keeps ranking in search.
+# Status makes that supersession explicit WITHOUT deleting anything, so the store
+# can do what a curated wiki does -- answer with current truth by default while
+# keeping the trail of how we got there. Stored in the sidecar like
+# tags/types/provenance/confidence, so it survives mem0's update() and never
+# affects embeddings/ranking.
+MEMORY_STATUSES = (
+    "active",      # current truth (the default; absent == active)
+    "superseded",  # a later memory replaced this one (see supersedes map)
+    "retired",     # no longer relevant at all (project dead, tool removed)
+)
+# Only these are returned by search unless the caller opts in.
+DEFAULT_SEARCH_STATUSES = ("active",)
+
+
+def normalize_status(value) -> "str | None":
+    """Normalize a status to one of MEMORY_STATUSES.
+
+    Same 3-way contract as normalize_type/normalize_origin/normalize_confidence:
+    "" for empty/None (meaning "unset", which reads as active), the canonical
+    lowercase status when recognized, or None when non-empty but unrecognized."""
+    if not value:
+        return ""
+    s = str(value).strip().lstrip("#").strip().lower()
+    if not s:
+        return ""
+    return s if s in MEMORY_STATUSES else None
+
+
+def status_of(statusmap: dict, mid: str) -> str:
+    """Effective status of a memory. An absent entry means 'active' so the whole
+    existing store reads as current without a migration."""
+    return (statusmap or {}).get(mid) or "active"
+
+
+def is_visible(statusmap: dict, mid: str, allowed=DEFAULT_SEARCH_STATUSES) -> bool:
+    """Whether a memory should surface in a recall scoped to `allowed` statuses."""
+    return status_of(statusmap, mid) in allowed
+
+
+def forget_supersede(meta: dict, mid: str) -> None:
+    """Drop every trace of `mid` from the status/supersedes maps.
+
+    Called when a memory is deleted. Without this the sidecar keeps growing stale
+    entries: the id stays marked `superseded` forever, and other memories keep
+    claiming to replace something that no longer exists -- which then renders as
+    'SUPERSEDED by <dead id>'. A relation left with no remaining targets is removed
+    entirely rather than kept as an empty shell."""
+    (meta.get("status") or {}).pop(mid, None)
+    supmap = meta.get("supersedes") or {}
+    supmap.pop(mid, None)                       # it replaced things: relation goes
+    for owner in list(supmap):
+        entry = supmap[owner]
+        replaces = entry.get("replaces") if isinstance(entry, dict) else entry
+        if not replaces or mid not in replaces:
+            continue
+        left = [x for x in replaces if x != mid]
+        if left:
+            if isinstance(entry, dict):
+                entry["replaces"] = left
+            else:
+                supmap[owner] = left
+        else:
+            supmap.pop(owner, None)
+
+
+def record_supersede(meta: dict, new_id: str, old_ids, reason: str = "") -> list:
+    """Mark `old_ids` as superseded BY `new_id` and record the relation.
+
+    Nothing is deleted -- the old memories stay in Chroma and stay reachable via
+    search_memories(include_superseded=True) and memory_history. Returns the ids
+    that actually changed (already-superseded ones are skipped) so callers can
+    report honestly. Pure sidecar bookkeeping: vectors and text are untouched."""
+    statusmap = meta.setdefault("status", {})
+    supmap = meta.setdefault("supersedes", {})
+    changed = []
+    for oid in old_ids:
+        if not oid or oid == new_id:
+            continue
+        if statusmap.get(oid) == "superseded":
+            continue
+        statusmap[oid] = "superseded"
+        changed.append(oid)
+    if changed:
+        entry = supmap.setdefault(new_id, {"replaces": [], "reason": ""})
+        # tolerate an older list-shaped value from a hand-edited sidecar
+        if isinstance(entry, list):
+            entry = {"replaces": entry, "reason": ""}
+            supmap[new_id] = entry
+        merged = sorted(set(entry.get("replaces") or []) | set(changed))
+        entry["replaces"] = merged
+        if reason:
+            entry["reason"] = reason
+    return changed
 
 
 # ---- temporal filtering (day-grained, deterministic) -------------------------

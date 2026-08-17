@@ -234,11 +234,59 @@ def test_update_resyncs_core_file_for_pinned(srv):
     srv.unpin_memory(mid)
 
 
-def test_add_memory_warns_on_near_duplicate(srv):
+def test_add_memory_gates_near_duplicate(srv, monkeypatch):
+    """With the optional gate ON, a near-duplicate is refused outright and the
+    refusal hands back the id and the three ways forward. Off by default: on a real
+    store cosine does not separate replacements from same-topic memories."""
+    monkeypatch.setattr(srv, "_DUP_GATE", True)
+    monkeypatch.setattr(srv, "_DUP_GATE_THRESHOLD", 0.92)
     uid = "test_dupwarn"
+    first = _new_id(srv.add_memory(
+        "The staging server is reachable at 10.9.9.9 on port 5432.", user_id=uid))
+    out = srv.add_memory(
+        "The staging server is reachable at 10.9.9.9 on port 5432.", user_id=uid)
+    assert "Not stored" in out
+    assert first in out                       # names the duplicate
+    for hint in ("supersedes", "update_memory", "force=True"):
+        assert hint in out
+    # nothing was written
+    assert len(srv._get_all(uid)) == 1
+
+
+def test_add_memory_force_stores_near_duplicate(srv, monkeypatch):
+    monkeypatch.setattr(srv, "_DUP_GATE", True)
+    monkeypatch.setattr(srv, "_DUP_GATE_THRESHOLD", 0.92)
+    uid = "test_dupforce"
     srv.add_memory("The staging server is reachable at 10.9.9.9 on port 5432.", user_id=uid)
-    out = srv.add_memory("The staging server is reachable at 10.9.9.9 on port 5432.", user_id=uid)
-    assert "LIKELY DUPLICATE" in out
+    out = srv.add_memory("The staging server is reachable at 10.9.9.9 on port 5432.",
+                         user_id=uid, force=True)
+    assert "Stored" in out
+    assert "LIKELY DUPLICATE" in out          # still told, just not blocked
+
+
+def test_add_memory_supersedes_hides_the_old_one(srv):
+    """The one-call path: store the correction AND retire what it replaced."""
+    uid = "test_dupsup"
+    old = _new_id(srv.add_memory("The prod API listens on port 8080.", user_id=uid))
+    out = srv.add_memory("The prod API listens on port 9090.", user_id=uid,
+                         supersedes=old)
+    assert "Stored" in out and "Superseded" in out and old in out
+    meta = srv._load_meta()
+    assert meta["status"][old] == "superseded"
+    new = _new_id(out)
+    assert meta["supersedes"][new]["replaces"] == [old]
+    # default recall no longer returns the stale one, opt-in does
+    assert old not in srv.search_memories("prod API port", user_id=uid)
+    assert old in srv.search_memories("prod API port", user_id=uid,
+                                      include_superseded=True)
+
+
+def test_add_memory_rejects_unknown_supersedes_id(srv):
+    uid = "test_dupbadid"
+    out = srv.add_memory("Some brand new fact about widgets.", user_id=uid,
+                         supersedes="does-not-exist")
+    assert "Nothing stored" in out
+    assert srv._get_all(uid) == []
 
 
 def test_add_memory_quiet_for_distinct(srv):

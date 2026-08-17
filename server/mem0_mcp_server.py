@@ -39,6 +39,7 @@ Env vars (all optional):
                          stdio proxy keeps it warm while a client is open.
 """
 import os
+import re
 import time
 import json
 import signal
@@ -69,6 +70,12 @@ from mem0_store import (
     normalize_confidence,
     CONFIDENCE_LEVELS,
     CONFIDENCE_RANK,
+    normalize_status,
+    MEMORY_STATUSES,
+    DEFAULT_SEARCH_STATUSES,
+    status_of,
+    record_supersede,
+    forget_supersede,
     parse_date,
     date_of,
 )
@@ -246,6 +253,26 @@ SEARCH_TOPK = int(os.environ.get("MEM0_SEARCH_TOPK", "10"))
 _DUP_THRESHOLD = float(os.environ.get("MEM0_DUP_THRESHOLD", "0.92"))
 # Skip the O(n^2) duplicate scan above this many memories (curate_memories only).
 _DUP_MAX_DOCS = int(os.environ.get("MEM0_DUP_MAX_DOCS", "2000"))
+# Optionally refuse a near-duplicate add unless the caller says what it replaces
+# (supersedes=) or that it is genuinely new (force=True).
+#
+# OFF by default, because cosine alone cannot carry this decision. Measured on a
+# real 776-memory store with the e5 embedder: overall similarity is high and tight
+# (median 0.845, p99 0.913, max 0.971), and eight hand-verified supersede pairs
+# landed at 0.896-0.952 -- i.e. squarely inside the noise. Every threshold is a bad
+# trade: 0.92 catches 62% of real replacements but blocks 53% of ALL adds, while
+# 0.95 blocks a tolerable 4.9% and catches only 12%. There is no separating value,
+# so a hard gate here would mostly obstruct legitimate writes.
+#
+# The leak it was meant to plug (corrections written as new memories while the
+# stale one keeps ranking) is instead addressed by making the RIGHT action cheap:
+# add_memory(..., supersedes=<ids>) does the store and the retirement in one call.
+# Turn the gate on with MEM0_DUP_GATE=1 if your embedder separates duplicates
+# better; retune MEM0_DUP_GATE_THRESHOLD with the same measurement before trusting it.
+_DUP_GATE = os.environ.get("MEM0_DUP_GATE", "0").strip().lower() in ("1", "true", "yes")
+# Kept separate from _DUP_THRESHOLD (which drives curate_memories' clustering) so
+# tuning the gate cannot silently change what curation reports.
+_DUP_GATE_THRESHOLD = float(os.environ.get("MEM0_DUP_GATE_THRESHOLD", "0.96"))
 
 # Versioning (no silent overwrite): update_memory / delete_memory archive the prior
 # text to the sidecar `history` map before mutating, so a change is never lost.
@@ -576,6 +603,20 @@ def _fmt_confidence(confmap: dict, mid) -> str:
     return f" (conf: {c})" if c else ""
 
 
+def _fmt_status(statusmap: dict, supmap: dict, mid) -> str:
+    """Leading marker for a non-active memory, or '' for the normal case. Only
+    shown when the caller opted into seeing stale memories, so it reads as a
+    warning rather than noise."""
+    st = status_of(statusmap, mid)
+    if st == "active":
+        return ""
+    if st == "retired":
+        return " 🛑RETIRED"
+    by = [n for n, e in (supmap or {}).items()
+          if mid in ((e or {}).get("replaces") if isinstance(e, dict) else (e or []))]
+    return f" ⚠️SUPERSEDED{(' by ' + by[0]) if by else ''}"
+
+
 def _apply_meta(meta: dict, mid: str, tags, mtype, origin, source, conf) -> None:
     """Write the sidecar maps for a freshly added memory id (no save -- the caller
     persists once). Shared by add_memory and the batch add path so they stay
@@ -650,7 +691,8 @@ def _sync_core_file(items: list) -> None:
 
 @mcp.tool()
 def add_memory(text: str, user_id: str = "", tags: str = "", mem_type: str = "",
-               origin: str = "", source: str = "", confidence: str = "") -> str:
+               origin: str = "", source: str = "", confidence: str = "",
+               supersedes: str = "", force: bool = False) -> str:
     """Store a memory. Call this THE MOMENT a durable, reusable fact appears --
     a decision, preference, config value, path/identifier, environment quirk, or
     recurring command -- not only at the end of a task. Never store secrets
@@ -661,7 +703,19 @@ def add_memory(text: str, user_id: str = "", tags: str = "", mem_type: str = "",
       memories. This tool also returns nearby existing memories.
     - Keep memory consistent (mem0-style): if your new fact UPDATES or merges an
       existing one, call update_memory(id, ...); if it CONTRADICTS/obsoletes one,
-      call delete_memory(id). Only add when it is genuinely new.
+      pass `supersedes` (comma/space-separated ids) HERE so the replacement and the
+      retirement happen in ONE call. Only add plain when it is genuinely new.
+
+    When this new fact replaces older ones, `supersedes` is strongly preferred over
+    writing prose like "this corrects the earlier note": prose leaves BOTH memories
+    ranking in recall, which is how a store ends up answering with last month's
+    truth. Superseded memories are never deleted -- they stay searchable via
+    search_memories(include_superseded=True).
+
+    (If the optional duplicate gate is enabled, a very close near-duplicate is
+    refused unless you pass `supersedes` or `force=True`; the refusal names the
+    duplicate and gives you the exact call to make. It is off by default because
+    cosine does not separate replacements from same-topic memories.)
     If user_id is omitted, the default user is used. Optionally pass `tags`
     (comma/space-separated, e.g. a project name like "32min") to scope later
     search_memories(tags=...); tags live in the sidecar and survive update_memory.
@@ -698,22 +752,62 @@ def add_memory(text: str, user_id: str = "", tags: str = "", mem_type: str = "",
                         f"{', '.join(CONFIDENCE_LEVELS)}. Stored WITHOUT a confidence.")
         norm_conf = ""
     source = (source or "").strip()
+    sup_ids = [t for t in re.split(r"[,\s]+", str(supersedes or "").strip()) if t]
+
+    def _sim(r):
+        s = r.get("score")
+        return None if s is None else 1.0 - s  # cosine distance -> similarity
+
     try:
+        superseded = []
         with _store_lock:
             # Dense nearest EXISTING memories (computed BEFORE the add) so we can
             # flag near-duplicates and nudge reconciliation instead of piling up.
             related = _dense_search(text, uid, RELATED_TOPK)
+            top_sim = _sim(related[0]) if related else None
+
+            # The gate: a near-duplicate must say what it replaces, or that it is
+            # genuinely new. Nothing is stored on refusal.
+            if (_DUP_GATE and not sup_ids and not force
+                    and top_sim is not None and top_sim >= _DUP_GATE_THRESHOLD):
+                dup = related[0]
+                did = dup.get("id", "N/A")
+                lines = [
+                    f"⛔ Not stored — this is a near-duplicate of an existing memory "
+                    f"(cosine {top_sim:.2f} ≥ {_DUP_GATE_THRESHOLD}).",
+                    f"   [id: {did}] {dup.get('memory', '(empty)')}",
+                    "",
+                    "Pick one and call again:",
+                    f"  • It REPLACES that memory  → add_memory(text=…, supersedes=\"{did}\")",
+                    f"  • It only REFINES it       → update_memory(\"{did}\", merged_text)",
+                    "  • It is genuinely NEW      → add_memory(text=…, force=True)",
+                ]
+                others = [r for r in related[1:] if (_sim(r) or 0) >= _DUP_GATE_THRESHOLD]
+                if others:
+                    lines.append("")
+                    lines.append("Other near-duplicates (supersedes takes several ids):")
+                    for r in others:
+                        lines.append(f"  • [sim {(_sim(r) or 0):.2f}] [id: {r.get('id','N/A')}] "
+                                     f"{r.get('memory', '(empty)')}")
+                return "\n".join(lines)
+
+            if sup_ids:
+                missing = [o for o in sup_ids if _memory_text(o) is None]
+                if missing:
+                    return (f"❌ Nothing stored: no memory with id(s) "
+                            f"{', '.join(missing)} to supersede. Re-check the ids "
+                            f"(search_memories returns them).")
+
             added = _results(m.add(text, user_id=uid, infer=False))
             new_id = added[0].get("id", "N/A") if added else "N/A"
             norm = normalize_tags(tags)
-            if (norm or norm_type or norm_origin or source or norm_conf) and new_id != "N/A":
+            if ((norm or norm_type or norm_origin or source or norm_conf or sup_ids)
+                    and new_id != "N/A"):
                 meta = _load_meta()
                 _apply_meta(meta, new_id, norm, norm_type, norm_origin, source, norm_conf)
+                if sup_ids:
+                    superseded = record_supersede(meta, new_id, sup_ids)
                 _save_meta(meta)
-
-        def _sim(r):
-            s = r.get("score")
-            return None if s is None else 1.0 - s  # cosine distance -> similarity
 
         typestr = f" [{norm_type}]" if norm_type else ""
         if norm_origin and source:
@@ -730,14 +824,20 @@ def add_memory(text: str, user_id: str = "", tags: str = "", mem_type: str = "",
         for w in (type_warning, origin_warning, conf_warning):
             if w:
                 out.append(w)
-        top_sim = _sim(related[0]) if related else None
-        if top_sim is not None and top_sim >= _DUP_THRESHOLD:
+        if superseded:
+            out.append(f"⚠️→✅ Superseded {len(superseded)} older memory(ies): "
+                       f"{', '.join(superseded)}. They are hidden from normal recall "
+                       f"but still stored (include_superseded=True to see them).")
+        already = [o for o in sup_ids if o not in superseded]
+        if already:
+            out.append(f"ℹ️ Already superseded, left as-is: {', '.join(already)}")
+        if top_sim is not None and top_sim >= _DUP_THRESHOLD and not sup_ids:
+            # only reachable with force=True or the gate disabled
             dup = related[0]
             out.append(f"\n⚠️ LIKELY DUPLICATE of [id: {dup.get('id', 'N/A')}] "
                        f"(cosine {top_sim:.2f}): {dup.get('memory', '(empty)')}")
-            out.append("→ This new entry looks redundant. Prefer reconciling over keeping "
-                       "both: update_memory(that id, merged_text) to fold them together, "
-                       "then delete_memory the leftover (this new id or the old one).")
+            out.append("→ Stored anyway because you passed force=True. If it actually "
+                       "replaces that memory, run supersede_memory(new_id, that id).")
         if related:
             out.append("\n🔎 Nearest existing memories (cosine) — if your new fact "
                        "duplicates / updates / contradicts any, reconcile it:")
@@ -746,7 +846,7 @@ def add_memory(text: str, user_id: str = "", tags: str = "", mem_type: str = "",
                 simstr = f"{sim:.2f}" if sim is not None else "?"
                 out.append(f"  • [sim {simstr}] [id: {r.get('id', 'N/A')}] {r.get('memory', '(empty)')}")
             out.append("→ update_memory(id, merged_text) to refine/merge, or "
-                       "delete_memory(id) to remove an outdated one.")
+                       "supersede_memory(new_id, id) if this new fact replaced it.")
         return "\n".join(out)
     except Exception as e:
         return f"❌ Save failed: {e}"
@@ -892,7 +992,8 @@ def update_memory(memory_id: str, text: str) -> str:
 @mcp.tool()
 def search_memories(query: str, user_id: str = "", tags: str = "", mem_type: str = "",
                     origin: str = "", min_confidence: str = "",
-                    since: str = "", until: str = "", changed_since: str = "") -> str:
+                    since: str = "", until: str = "", changed_since: str = "",
+                    include_superseded: bool = False, status: str = "") -> str:
     """Search the user's long-term memory (shared across all their LLM clients).
     Call this FIRST at the start of a task (with its key terms) and BEFORE asking
     the user for information they may have provided before -- recalling is cheaper
@@ -905,8 +1006,18 @@ def search_memories(query: str, user_id: str = "", tags: str = "", mem_type: str
     confident (memories with NO confidence are excluded when this is set). Temporal
     scope (date 'YYYY-MM-DD', inclusive): `since`/`until` filter by CREATED date,
     `changed_since` by last-CHANGED date (updated, else created). All filters
-    combine (AND). Returns memories with IDs (plus 📌, a [type] label, «provenance»,
-    a (conf: …) label, and #tags) so you can update_memory / delete_memory them."""
+    combine (AND).
+
+    By DEFAULT only CURRENT memories are returned: anything marked superseded (a
+    later memory replaced it) or retired is hidden, so recall answers with today's
+    truth instead of every draft that led to it. Pass `include_superseded=True` to
+    see the full trail (stale hits are flagged ⚠️SUPERSEDED / 🛑RETIRED), or
+    `status` (active, superseded, retired) to look at exactly one bucket -- useful
+    for auditing what has gone stale.
+
+    Returns memories with IDs (plus 📌, a [type] label, «provenance», a (conf: …)
+    label, and #tags) so you can update_memory / delete_memory / supersede_memory
+    them."""
     try:
         uid = user_id or DEFAULT_USER
         want = set(normalize_tags(tags))
@@ -927,12 +1038,29 @@ def search_memories(query: str, user_id: str = "", tags: str = "", mem_type: str
                                 ("changed_since", changed_since, changed_d)):
             if val is None:
                 return f"❌ Invalid {label} date '{raw}'. Use YYYY-MM-DD."
+        want_status = normalize_status(status)
+        if want_status is None:
+            return (f"❌ Unknown status '{status}'. Valid: "
+                    f"{', '.join(MEMORY_STATUSES)} (or omit status).")
+        if want_status:
+            allowed = (want_status,)            # explicit bucket wins
+        elif include_superseded:
+            allowed = tuple(MEMORY_STATUSES)    # show everything
+        else:
+            allowed = DEFAULT_SEARCH_STATUSES   # current truth only
         min_rank = CONFIDENCE_RANK.get(want_conf, 0)
         temporal = bool(since_d or until_d or changed_d)
-        need_filter = bool(want or want_type or want_origin or want_conf or temporal)
         with _store_lock:
             meta = _load_meta()
             tagmap = meta.get("tags", {})
+            statusmap = meta.get("status", {})
+            supmap = meta.get("supersedes", {})
+            # Skip the status pass entirely while nothing has been marked -- the
+            # whole existing store reads as active, so filtering would be a no-op
+            # that only costs a bigger search pool.
+            status_filtering = bool(statusmap) and set(allowed) != set(MEMORY_STATUSES)
+            need_filter = bool(want or want_type or want_origin or want_conf
+                               or temporal or status_filtering)
             typemap = meta.get("types", {})
             provmap = meta.get("provenance", {})
             confmap = meta.get("confidence", {})
@@ -943,6 +1071,8 @@ def search_memories(query: str, user_id: str = "", tags: str = "", mem_type: str
                 results = []
                 for r in pool:
                     mid = r.get("id")
+                    if status_filtering and status_of(statusmap, mid) not in allowed:
+                        continue
                     if want and not (want & set(tagmap.get(mid) or [])):
                         continue
                     if want_type and typemap.get(mid) != want_type:
@@ -984,6 +1114,10 @@ def search_memories(query: str, user_id: str = "", tags: str = "", mem_type: str
             scope_bits.append(f"changed_since: {changed_d}")
         if want:
             scope_bits.append("tags: " + ", ".join(sorted(want)))
+        if want_status:
+            scope_bits.append(f"status: {want_status}")
+        elif include_superseded:
+            scope_bits.append("incl. superseded")
         scope = (" [" + "; ".join(scope_bits) + "]") if scope_bits else ""
         if not results:
             return f"🔍 No results.{scope}"
@@ -991,7 +1125,8 @@ def search_memories(query: str, user_id: str = "", tags: str = "", mem_type: str
         for i, r in enumerate(results, 1):
             mid = r.get("id")
             pin = " 📌" if mid in pinned else ""
-            out += (f"{i}. [id: {mid or 'N/A'}]{pin}{_fmt_type(typemap, mid)} "
+            out += (f"{i}. [id: {mid or 'N/A'}]{pin}"
+                    f"{_fmt_status(statusmap, supmap, mid)}{_fmt_type(typemap, mid)} "
                     f"{r.get('memory', '(empty)')}"
                     f"{_fmt_provenance(provmap, mid)}{_fmt_confidence(confmap, mid)}"
                     f"{_fmt_tags(tagmap, mid)}\n")
@@ -1019,6 +1154,8 @@ def list_memories(user_id: str = "", since: str = "", until: str = "") -> str:
             typemap = meta.get("types", {})
             provmap = meta.get("provenance", {})
             confmap = meta.get("confidence", {})
+            statusmap = meta.get("status", {})
+            supmap = meta.get("supersedes", {})
         if since_d or until_d:
             kept = []
             for r in results:
@@ -1043,7 +1180,10 @@ def list_memories(user_id: str = "", since: str = "", until: str = "") -> str:
         for i, r in enumerate(results, 1):
             mid = r.get("id")
             pin = " 📌" if mid in pinned else ""
-            out += (f"{i}. [ID: {mid or 'N/A'}]{pin}{_fmt_type(typemap, mid)} "
+            # list_memories shows EVERYTHING (it is an inventory, not recall), so a
+            # stale entry must carry its badge or it reads as current truth here.
+            out += (f"{i}. [ID: {mid or 'N/A'}]{pin}"
+                    f"{_fmt_status(statusmap, supmap, mid)}{_fmt_type(typemap, mid)} "
                     f"{r.get('memory', '(empty)')}"
                     f"{_fmt_provenance(provmap, mid)}{_fmt_confidence(confmap, mid)}"
                     f"{_fmt_tags(tagmap, mid)}\n")
@@ -1071,6 +1211,7 @@ def delete_memory(memory_id: str) -> str:
             meta["types"].pop(memory_id, None)
             meta["provenance"].pop(memory_id, None)
             meta["confidence"].pop(memory_id, None)
+            forget_supersede(meta, memory_id)
             # meta["history"][memory_id] is intentionally KEPT (restore-after-delete).
             _save_meta(meta)
             if was_pinned:
@@ -1254,6 +1395,80 @@ def set_confidence(memory_id: str, confidence: str = "") -> str:
         return f"🎚️  Cleared the confidence on '{memory_id}'."
     except Exception as e:
         return f"❌ Set confidence failed: {e}"
+
+
+@mcp.tool()
+def supersede_memory(new_id: str, old_ids: str, reason: str = "") -> str:
+    """Record that `new_id` REPLACES one or more older memories (comma/space-
+    separated `old_ids`), so recall stops returning the outdated ones.
+
+    Use this INSTEAD of delete_memory whenever a fact changed rather than turned
+    out to be junk: a plan that shipped, an estimate that was corrected, a config
+    that moved. Nothing is deleted -- the old memories keep their text, vectors and
+    history, and stay reachable via search_memories(include_superseded=True) -- but
+    they drop out of normal recall, so the store answers with CURRENT truth while
+    preserving how you got there. Pass a short `reason` (what changed) when it is
+    not obvious from the new memory's text.
+
+    Prefer this over writing a fresh memory that merely SAYS the old one is wrong:
+    that leaves both ranking side by side, which is exactly what this fixes."""
+    try:
+        olds = [t for t in re.split(r"[,\s]+", str(old_ids or "").strip()) if t]
+        if not olds:
+            return "❌ No old_ids given. Pass the ids this memory replaces."
+        with _store_lock:
+            if _memory_text(new_id) is None:
+                return f"❌ No memory with id '{new_id}' (the replacement)."
+            missing = [o for o in olds if _memory_text(o) is None]
+            if missing:
+                return f"❌ No memory with id(s): {', '.join(missing)}."
+            if new_id in olds:
+                return "❌ A memory cannot supersede itself."
+            meta = _load_meta()
+            changed = record_supersede(meta, new_id, olds, reason.strip())
+            _save_meta(meta)
+        if not changed:
+            return f"⚠️  Nothing to do: {', '.join(olds)} already superseded."
+        skipped = [o for o in olds if o not in changed]
+        msg = (f"⚠️→✅ Marked {len(changed)} memory(ies) superseded by '{new_id}': "
+               f"{', '.join(changed)}. They stay stored and are still reachable "
+               f"with search_memories(include_superseded=True).")
+        if skipped:
+            msg += f" (already superseded: {', '.join(skipped)})"
+        return msg
+    except Exception as e:
+        return f"❌ Supersede failed: {e}"
+
+
+@mcp.tool()
+def set_status(memory_id: str, status: str = "") -> str:
+    """Set a memory's lifecycle status: active, superseded, or retired (empty
+    string clears it back to active).
+
+    `retired` is for knowledge that is no longer relevant at all -- a dead project,
+    a removed tool -- as opposed to `superseded`, which means a NEWER memory took
+    its place (prefer supersede_memory there, so the replacement is recorded too).
+    Retired and superseded memories are hidden from normal recall but never
+    deleted. Sidecar-only: text, vectors and ranking are untouched."""
+    try:
+        norm = normalize_status(status)
+        if norm is None:
+            return (f"❌ Unknown status '{status}'. Valid: "
+                    f"{', '.join(MEMORY_STATUSES)} (empty string clears it).")
+        with _store_lock:
+            if _memory_text(memory_id) is None:
+                return f"❌ No memory with id '{memory_id}'."
+            meta = _load_meta()
+            if norm and norm != "active":
+                meta["status"][memory_id] = norm
+            else:
+                meta["status"].pop(memory_id, None)
+            _save_meta(meta)
+        if norm and norm != "active":
+            return f"🏷️  Set status of '{memory_id}' to {norm}."
+        return f"🏷️  '{memory_id}' is active again (visible in normal recall)."
+    except Exception as e:
+        return f"❌ Set status failed: {e}"
 
 
 @mcp.tool()

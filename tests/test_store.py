@@ -12,10 +12,12 @@ from mem0_store import (
     normalize_confidence, CONFIDENCE_LEVELS, parse_date, date_of,
     acquire_single_writer_lock, SingleWriterLockError, WRITER_LOCKFILE,
     recreate_collection_cosine,
+    normalize_status, MEMORY_STATUSES, DEFAULT_SEARCH_STATUSES,
+    status_of, is_visible, record_supersede, forget_supersede,
 )
 
 DEFAULTS = {"pinned": [], "access": {}, "tags": {}, "types": {}, "provenance": {},
-            "confidence": {}, "history": {}}
+            "confidence": {}, "history": {}, "status": {}, "supersedes": {}}
 
 
 class TestExpand:
@@ -377,3 +379,116 @@ class TestRecreateCollectionCosine:
         col = recreate_collection_cosine(client, "c", ["a"], [[1.0]], [{}])
         assert len(col.added) == 1
         assert col.added[0]["ids"] == ["a"]
+
+
+class TestStatus:
+    """Lifecycle status: the sidecar layer that lets recall answer with current
+    truth while the superseded trail stays stored."""
+
+    @pytest.mark.parametrize("raw,want", [
+        ("", ""), (None, ""), ("  ", ""),
+        ("active", "active"), ("SUPERSEDED", "superseded"),
+        (" #Retired ", "retired"),
+    ])
+    def test_normalize_accepts(self, raw, want):
+        assert normalize_status(raw) == want
+
+    @pytest.mark.parametrize("raw", ["stale", "deleted", "archived", "1"])
+    def test_normalize_rejects_unknown(self, raw):
+        assert normalize_status(raw) is None
+
+    def test_vocabulary_and_default_scope(self):
+        assert MEMORY_STATUSES == ("active", "superseded", "retired")
+        assert DEFAULT_SEARCH_STATUSES == ("active",)
+
+    def test_absent_entry_reads_as_active(self):
+        # the whole pre-existing store must read as current with no migration
+        assert status_of({}, "any-id") == "active"
+        assert status_of({"other": "retired"}, "any-id") == "active"
+        assert is_visible({}, "any-id") is True
+
+    def test_non_active_is_hidden_by_default(self):
+        smap = {"a": "superseded", "b": "retired"}
+        assert is_visible(smap, "a") is False
+        assert is_visible(smap, "b") is False
+        assert is_visible(smap, "a", MEMORY_STATUSES) is True
+
+
+class TestSupersede:
+    def test_marks_old_and_records_relation(self):
+        meta = load_meta("/nonexistent-on-purpose.json")
+        changed = record_supersede(meta, "new1", ["old1", "old2"], "shipped")
+        assert sorted(changed) == ["old1", "old2"]
+        assert meta["status"] == {"old1": "superseded", "old2": "superseded"}
+        assert meta["supersedes"]["new1"]["replaces"] == ["old1", "old2"]
+        assert meta["supersedes"]["new1"]["reason"] == "shipped"
+        # the replacement itself stays visible
+        assert status_of(meta["status"], "new1") == "active"
+
+    def test_is_idempotent_and_merges(self):
+        meta = load_meta("/nonexistent-on-purpose.json")
+        record_supersede(meta, "new1", ["old1"])
+        again = record_supersede(meta, "new1", ["old1", "old2"])
+        assert again == ["old2"]                      # old1 skipped, honestly reported
+        assert meta["supersedes"]["new1"]["replaces"] == ["old1", "old2"]
+
+    def test_ignores_self_and_empties(self):
+        meta = load_meta("/nonexistent-on-purpose.json")
+        assert record_supersede(meta, "new1", ["new1", "", None]) == []
+        assert meta["status"] == {}
+        assert "new1" not in meta["supersedes"]
+
+    def test_tolerates_hand_edited_list_shape(self):
+        meta = load_meta("/nonexistent-on-purpose.json")
+        meta["supersedes"]["new1"] = ["old0"]          # older/hand-written shape
+        record_supersede(meta, "new1", ["old1"])
+        assert meta["supersedes"]["new1"]["replaces"] == ["old0", "old1"]
+
+    def test_reason_is_not_clobbered_by_a_later_blank(self):
+        meta = load_meta("/nonexistent-on-purpose.json")
+        record_supersede(meta, "new1", ["old1"], "first reason")
+        record_supersede(meta, "new1", ["old2"], "")
+        assert meta["supersedes"]["new1"]["reason"] == "first reason"
+
+
+class TestForgetSupersede:
+    """Deleting a memory must leave no trace in status/supersedes, or the sidecar
+    grows stale entries and pages render 'SUPERSEDED by <dead id>'."""
+
+    def _meta(self):
+        return load_meta("/nonexistent-on-purpose.json")
+
+    def test_clears_own_status(self):
+        meta = self._meta()
+        record_supersede(meta, "new1", ["old1"])
+        forget_supersede(meta, "old1")
+        assert meta["status"] == {}
+        assert "new1" not in meta["supersedes"]     # relation had only that target
+
+    def test_keeps_relation_when_other_targets_remain(self):
+        meta = self._meta()
+        record_supersede(meta, "new1", ["old1", "old2"])
+        forget_supersede(meta, "old1")
+        assert meta["supersedes"]["new1"]["replaces"] == ["old2"]
+        assert meta["status"] == {"old2": "superseded"}
+
+    def test_deleting_the_replacement_drops_the_relation(self):
+        meta = self._meta()
+        record_supersede(meta, "new1", ["old1"])
+        forget_supersede(meta, "new1")
+        assert "new1" not in meta["supersedes"]
+        # the old one keeps its status: it is still genuinely outdated
+        assert meta["status"]["old1"] == "superseded"
+
+    def test_is_safe_on_unknown_id(self):
+        meta = self._meta()
+        record_supersede(meta, "new1", ["old1"])
+        forget_supersede(meta, "never-seen")
+        assert meta["status"] == {"old1": "superseded"}
+        assert meta["supersedes"]["new1"]["replaces"] == ["old1"]
+
+    def test_tolerates_hand_edited_list_shape(self):
+        meta = self._meta()
+        meta["supersedes"]["new1"] = ["old1", "old2"]
+        forget_supersede(meta, "old1")
+        assert meta["supersedes"]["new1"] == ["old2"]
